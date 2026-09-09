@@ -3665,6 +3665,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         """Startup output: light-mode probe, banner, advisories, resume/welcome lines, tips."""
         with suppress(Exception):  # light-mode probe before pt grabs the tty (cached)
             _detect_light_mode()
+        # A prior non-fullscreen prompt_toolkit session may have left its composer/status
+        # rows in the visible viewport. Remove only that viewport before positioning the
+        # new startup output; transcript scrollback is intentionally preserved.
+        self._prepare_tui_startup_viewport()
         # Scroll the cursor to the last row so banner, responses and prompt pin to the bottom.
         with suppress(Exception):
             _term_lines = shutil.get_terminal_size().lines

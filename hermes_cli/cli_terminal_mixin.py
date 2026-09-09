@@ -159,6 +159,31 @@ class CLITerminalMixin:
             return raw.strip().lower() in {"1", "true", "yes", "on", "always"}
         return bool(raw)
 
+    def _prepare_tui_startup_viewport(self) -> bool:
+        """Remove stale visible chrome before a new non-fullscreen TUI starts.
+
+        A previous prompt_toolkit process can leave its last composer/status rows in the
+        current viewport.  Startup used to print blank lines to move below those rows,
+        preserving the ghosts as apparent second input fields.  Clear only the visible
+        viewport here; the transcript scrollback remains intact and can still be rebuilt
+        by the existing explicit ``cli_rebuild_scrollback_on_redraw`` option.
+        """
+        if getattr(self, "_terminal_io_broken", False):
+            return False
+        try:
+            stream = sys.stdout
+            if stream is None or not stream.isatty():
+                return False
+            stream.write("\x1b[2J\x1b[H")
+            stream.flush()
+            return True
+        except OSError as exc:
+            if _is_eio(exc):
+                self._mark_terminal_io_broken("startup_viewport")
+        except Exception:
+            pass
+        return False
+
     def _recover_terminal_after_interrupt(self) -> None:
         """Recover the terminal after an interrupted agent turn (#33271): an in-flight
         ``CSI 6n`` reply arriving after the input parser tore down leaks as literal text

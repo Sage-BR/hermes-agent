@@ -15,6 +15,7 @@ import pytest
 
 import cli as cli_mod
 from cli import HermesCLI
+from hermes_cli import cli_terminal_mixin as terminal_mod
 
 
 @pytest.fixture
@@ -29,6 +30,27 @@ class TestForceFullRedraw:
         # _force_full_redraw must be a no-op when the TUI isn't running.
         bare_cli._app = None
         bare_cli._force_full_redraw()  # must not raise
+
+    def test_startup_clears_visible_viewport_without_scrollback_wipe(self, bare_cli, monkeypatch):
+        """A fresh TUI must not display the previous session's composer as a second input."""
+        stream = MagicMock()
+        stream.isatty.return_value = True
+        monkeypatch.setattr(terminal_mod.sys, "stdout", stream)
+
+        assert bare_cli._prepare_tui_startup_viewport() is True
+
+        stream.write.assert_called_once_with("\x1b[2J\x1b[H")
+        stream.flush.assert_called_once_with()
+        # CSI 3J is intentionally absent: startup preserves conversation scrollback.
+        assert "\x1b[3J" not in stream.write.call_args.args[0]
+
+    def test_startup_viewport_is_noop_without_tty(self, bare_cli, monkeypatch):
+        stream = MagicMock()
+        stream.isatty.return_value = False
+        monkeypatch.setattr(terminal_mod.sys, "stdout", stream)
+
+        assert bare_cli._prepare_tui_startup_viewport() is False
+        stream.write.assert_not_called()
 
 
 
