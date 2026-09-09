@@ -148,6 +148,48 @@ def _custom_provider_ssl_context(base_url: str):
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
 _ai_gateway_catalog_cache: list[tuple[str, str]] | None = None
 
+# The curated result is persisted so a fresh Hermes process does not download the full OpenRouter
+# catalog again. Its lifetime follows the manifest cache instead of using a second independent TTL.
+def _openrouter_catalog_disk_ttl() -> float:
+    from hermes_cli.model_catalog import refresh_interval_seconds
+
+    return refresh_interval_seconds()
+
+
+def _openrouter_catalog_disk_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "cache" / "openrouter_curated_catalog.json"
+
+
+def _read_openrouter_catalog_disk() -> list[tuple[str, str]] | None:
+    """Return a fresh curated catalog from disk, or None when absent/corrupt/expired."""
+    obj = _read_json_cache(_openrouter_catalog_disk_path())
+    if obj is None:
+        return None
+    try:
+        if time.time() - float(obj.get("fetched_at", 0)) > _openrouter_catalog_disk_ttl():
+            return None
+    except (TypeError, ValueError):
+        return None
+    items = obj.get("curated")
+    if not isinstance(items, list):
+        return None
+    out = [(str(item[0]), str(item[1])) for item in items
+           if isinstance(item, (list, tuple)) and len(item) == 2]
+    return out or None
+
+
+def _write_openrouter_catalog_disk(curated: list[tuple[str, str]]) -> None:
+    """Persist the last known-good curated catalog without affecting the request path."""
+    try:
+        _write_json_cache(
+            _openrouter_catalog_disk_path(),
+            {"fetched_at": time.time(), "curated": [list(item) for item in curated]},
+        )
+    except Exception as exc:
+        logger.debug("openrouter curated catalog disk write failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Nous Portal free-model helpers — the Portal models endpoint is the source of truth for what is
@@ -473,6 +515,13 @@ def fetch_openrouter_models(
     if _openrouter_catalog_cache is not None and not force_refresh:
         return list(_openrouter_catalog_cache)
 
+    # Cold process: use the last known-good curated result before paying the live catalog cost.
+    if not force_refresh:
+        disk = _read_openrouter_catalog_disk()
+        if disk:
+            _openrouter_catalog_cache = disk
+            return list(disk)
+
     # Remote catalog manifest first, in-repo snapshot when unreachable; the live /v1/models filter
     # (tool support, free pricing) is applied on top either way.
     try:
@@ -514,6 +563,7 @@ def fetch_openrouter_models(
     if not curated[0][1]:
         curated[0] = (curated[0][0], "recommended")
     _openrouter_catalog_cache = curated
+    _write_openrouter_catalog_disk(curated)
     return list(curated)
 
 
@@ -2106,6 +2156,20 @@ def github_model_reasoning_efforts(
     return _github_reasoning_efforts_for_model_id(str(model_id or normalized))
 
 
+# Short-lived negative cache for unreachable custom-provider catalogs. It prevents repeated picker
+# opens from paying the full timeout for both ``base`` and ``base/v1`` while still recovering quickly.
+_probe_neg_cache: dict[str, float] = {}
+_PROBE_NEG_TTL = 60.0
+
+
+def _probe_neg_key(base_url: str) -> Optional[str]:
+    """Return the canonical host:port key for a provider origin, or None when invalid."""
+    from utils import base_url_origin
+
+    _, host, port = base_url_origin(base_url)
+    return f"{host}:{port}" if host else None
+
+
 def _probe_result(
     models, probed_url, resolved_base_url, suggested_base_url=None, used_fallback=False
 ) -> dict[str, Any]:
@@ -2137,6 +2201,17 @@ def probe_api_models(
         candidates.append((alternate_base, True))
 
     tried: list[str] = []
+    _neg_key = _probe_neg_key(normalized)
+    if _neg_key is not None:
+        _neg_seen = _probe_neg_cache.get(_neg_key)
+        if _neg_seen is not None and (time.monotonic() - _neg_seen) < _PROBE_NEG_TTL:
+            return _probe_result(
+                None,
+                normalized.rstrip("/") + "/models",
+                normalized,
+                alternate_base if alternate_base != normalized else None,
+            )
+
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
     if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
         headers["X-Goog-Api-Client"] = f"hermes-agent/{_HERMES_VERSION}"
@@ -2159,16 +2234,25 @@ def probe_api_models(
     _ssl_context = _custom_provider_ssl_context(normalized)
     if _ssl_context is not None:
         _open_kwargs["ssl_context"] = _ssl_context
+    reachable = False
     for candidate_base, is_fallback in candidates:
         url = candidate_base.rstrip("/") + "/models"
         tried.append(url)
         try:
             data = _get_json(url, timeout=timeout, headers=headers, **_open_kwargs)
+        except urllib.error.HTTPError:
+            # The server answered. Auth/404 errors must not mask an immediately corrected key.
+            reachable = True
+            continue
         except Exception:
             continue
+        if _neg_key is not None:
+            _probe_neg_cache.pop(_neg_key, None)
         return _probe_result(
             [m.get("id", "") for m in data.get("data", [])], url, candidate_base.rstrip("/"),
             alternate_base if alternate_base != candidate_base else normalized, is_fallback)
+    if _neg_key is not None and not reachable:
+        _probe_neg_cache[_neg_key] = time.monotonic()
     return _probe_result(
         None, tried[0] if tried else normalized.rstrip("/") + "/models", normalized,
         alternate_base if alternate_base != normalized else None)

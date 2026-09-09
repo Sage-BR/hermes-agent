@@ -21,7 +21,9 @@ provider list and a patched request seam.
 
 from __future__ import annotations
 
+import json
 import ssl
+import time
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -310,3 +312,97 @@ class TestCatalogProbeThreadsSSLContext:
 
         assert probe["models"] == ["local-model"]
         assert calls == ["http://localhost:8000/models"]
+
+
+class TestCatalogProbeNegativeCache:
+    """Unreachable probes are coalesced briefly; HTTP responses remain retryable."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_probe_neg_cache(self):
+        import hermes_cli.models as models
+
+        models._probe_neg_cache.clear()
+        yield
+        models._probe_neg_cache.clear()
+
+    @staticmethod
+    def _response(model_id="m1"):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [{"id": model_id}]}).encode()
+
+        return _Resp()
+
+    def test_repeated_unreachable_probe_skips_network_within_ttl(self, monkeypatch):
+        import hermes_cli.models as models
+
+        calls = []
+
+        def fail(req, **kwargs):
+            calls.append(req.full_url)
+            raise TimeoutError("connect timed out")
+
+        monkeypatch.setattr(models, "_urlopen_model_catalog_request", fail)
+        monkeypatch.setattr(models, "_custom_provider_ssl_context", lambda base_url: None)
+
+        first = models.probe_api_models("key", "https://blackhole.example.invalid/v1", timeout=1)
+        second = models.probe_api_models("key", "https://blackhole.example.invalid/v1/", timeout=1)
+
+        assert first["models"] is None
+        assert second["models"] is None
+        assert len(calls) == 2  # /v1 and root share one host:port cache entry
+
+    def test_http_error_is_not_cached_and_corrected_key_can_recover(self, monkeypatch):
+        import hermes_cli.models as models
+
+        calls = []
+
+        def unauthorized(req, **kwargs):
+            calls.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+        monkeypatch.setattr(models, "_urlopen_model_catalog_request", unauthorized)
+        monkeypatch.setattr(models, "_custom_provider_ssl_context", lambda base_url: None)
+
+        failed = models.probe_api_models("bad-key", "https://reachable.example.invalid/v1", timeout=1)
+        assert failed["models"] is None
+        assert "reachable.example.invalid:443" not in models._probe_neg_cache
+
+        monkeypatch.setattr(
+            models, "_urlopen_model_catalog_request", lambda req, **kwargs: self._response()
+        )
+        recovered = models.probe_api_models("correct-key", "https://reachable.example.invalid/v1", timeout=1)
+
+        assert recovered["models"] == ["m1"]
+        assert len(calls) == 2
+
+    def test_success_after_expiry_clears_negative_entry(self, monkeypatch):
+        import hermes_cli.models as models
+
+        key = "recoverable.example.invalid:443"
+        old = time.monotonic() - models._PROBE_NEG_TTL - 1
+        models._probe_neg_cache[key] = old
+        monkeypatch.setattr(models, "_custom_provider_ssl_context", lambda base_url: None)
+
+        def fail(req, **kwargs):
+            raise TimeoutError("still down")
+
+        monkeypatch.setattr(models, "_urlopen_model_catalog_request", fail)
+        failed = models.probe_api_models("key", "https://recoverable.example.invalid/v1", timeout=1)
+        assert failed["models"] is None
+        assert models._probe_neg_cache[key] > old
+
+        models._probe_neg_cache[key] = old  # expired again, so the successful probe runs
+        monkeypatch.setattr(
+            models, "_urlopen_model_catalog_request", lambda req, **kwargs: self._response("recovered")
+        )
+        recovered = models.probe_api_models("key", "https://recoverable.example.invalid/v1", timeout=1)
+
+        assert recovered["models"] == ["recovered"]
+        assert key not in models._probe_neg_cache
