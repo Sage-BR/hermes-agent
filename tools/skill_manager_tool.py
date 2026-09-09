@@ -83,6 +83,7 @@ def _skills_dir() -> Path:
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
+MAX_CORE_SKILL_CONTENT_CHARS = 30_000  # Keep always-loaded SKILL.md files out of the prompt hot path.
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-friendly
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
@@ -164,6 +165,12 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
 
 
 def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
+    if label == "SKILL.md" and len(content) > MAX_CORE_SKILL_CONTENT_CHARS:
+        return (
+            f"{label} content is {len(content):,} characters (core limit: "
+            f"{MAX_CORE_SKILL_CONTENT_CHARS:,}). Split detailed material into "
+            f"references/, templates/, or scripts/ and keep SKILL.md as the "
+            "lean workflow/index. Preserve the complete logic in those files.")
     if len(content) > MAX_SKILL_CONTENT_CHARS:
         return (
             f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "

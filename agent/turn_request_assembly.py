@@ -57,7 +57,7 @@ def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original
             aggregator=moa_config.get("aggregator") or {},
             temperature=_preset_temperature(moa_config, "reference_temperature"),
             aggregator_temperature=_preset_temperature(moa_config, "aggregator_temperature"),
-
+            reference_max_tokens=moa_config.get("reference_max_tokens"),
             # None = no per-preset override; inherit auxiliary.moa_reference.timeout.
             reference_timeout=(
                 float(moa_config["reference_timeout"])
@@ -87,6 +87,8 @@ def _prepare_moa_request(agent: Any, api_messages: Any, pending_moa_prepared_req
     """Persistent-MoA request: rebase the pending prepared request onto the new messages
     when the client supports it, else prepare a fresh one. Returns
     ``(prepared_request, api_messages, pending_moa_prepared_request)``."""
+    if agent.client is None:
+        return None, api_messages, pending_moa_prepared_request
     _moa_completions = getattr(getattr(agent.client, "chat", None), "completions", None)
     prepared: Any = None
     if pending_moa_prepared_request is not None:

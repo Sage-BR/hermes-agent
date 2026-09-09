@@ -169,6 +169,36 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
+def test_opencode_rate_limit_waits_for_provider_recovery(monkeypatch):
+    """OpenCode free-tier 429s should retry the same model after ~5s before fallback."""
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    err = type("RateLimitError", (Exception,), {"status_code": 429})()
+
+    first, policy = retry_utils.adaptive_rate_limit_backoff(
+        1, base_url="https://opencode.ai/zen/v1", model="muse-spark-1.3-contributor-free",
+        error=err, default_wait=2.0,
+    )
+    second, second_policy = retry_utils.adaptive_rate_limit_backoff(
+        2, base_url="https://opencode.ai/zen/v1", model="muse-spark-1.3-contributor-free",
+        error=err, default_wait=2.0,
+    )
+
+    assert first == 5.0
+    assert second == 10.0
+    assert policy == second_policy == "opencode_rate_limit"
+
+
+def test_opencode_provider_failure_uses_recovery_window(monkeypatch):
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    ErrorType = type("InternalServerError", (Exception,), {"status_code": 500})
+    wait, policy = retry_utils.adaptive_rate_limit_backoff(
+        1, base_url="https://opencode.ai/zen/v1", model="muse-spark-1.3-contributor-free",
+        error=ErrorType(), default_wait=2.0,
+    )
+    assert wait == 5.0
+    assert policy == "opencode_provider_retry"
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------

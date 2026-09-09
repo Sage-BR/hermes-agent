@@ -72,6 +72,10 @@ Quality bar:
   complex one. Don't re-paste the source docs. (For a knowledge-base skill
   this cap applies to SKILL.md itself — the distilled content lives in
   `references/` files; see the knowledge-base rules.)
+- Hard limit: never produce a monolithic SKILL.md over 30,000 characters.
+  If the material approaches that size, stop expanding the core and move the
+  complete topic logic into ordered `references/` files. The core must retain
+  the decision rules and an explicit routing index, not a lossy summary.
 - Don't write a router/index/hub skill that only points at other skills.
   (A knowledge-base SKILL.md indexing its OWN `references/` files is not a
   hub — that layout is required for large sources.)

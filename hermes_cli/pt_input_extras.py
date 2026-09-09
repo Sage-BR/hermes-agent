@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
+import sys
+import textwrap
+
 # kitty CSI-u ORs lock-key state into the modifier parameter of every key event while a lock is
 # on: CapsLock=64, NumLock=128, both=192. Every fixed-modifier CSI-u (and legacy CSI-tilde /
 # CSI-letter) registration therefore needs lock-offset twins, or those events leak into the prompt
@@ -31,6 +36,47 @@ def _clear_vt100_prefix_cache() -> None:
         _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
     except Exception:
         pass
+
+
+def install_windows_paste_batch() -> int:
+    """Raise prompt_toolkit's Win32 read batch so large pastes arrive atomically.
+
+    ``ConsoleInputReader`` reads at most 2048 ``INPUT_RECORD`` items.  A large
+    paste can therefore be split across reads; the first batch is inserted into
+    the TUI, while later CR records are interpreted as Enter and submit pieces
+    of the same paste.  The public prompt_toolkit API does not expose this
+    limit, so patch the small local constant defensively and leave VT100 input
+    untouched.  A sentinel makes the operation idempotent.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        from prompt_toolkit.input.win32 import ConsoleInputReader
+    except Exception:
+        return 0
+
+    original = ConsoleInputReader.read
+    if getattr(original, "_hermes_large_paste_batch", False):
+        return 0
+    try:
+        source = textwrap.dedent(inspect.getsource(original))
+        old = "max_count = 2048  # Max events to read at the same time."
+        if old not in source:
+            return 0
+        source = source.replace(old, "max_count = 262144  # Hermes: keep large pastes in one read batch.", 1)
+        namespace = dict(original.__globals__)
+        exec(compile(source, inspect.getsourcefile(original) or "<prompt_toolkit>", "exec"), namespace)
+        patched = namespace.get("read")
+        if not callable(patched):
+            return 0
+        patched = functools.wraps(original)(patched)
+        patched._hermes_large_paste_batch = True
+        ConsoleInputReader.read = patched
+        return 1
+    except Exception:
+        # Input hardening must never prevent Hermes from starting after a
+        # prompt_toolkit upgrade changes the private implementation.
+        return 0
 
 
 def _install(build, *, overwrite: bool) -> int:

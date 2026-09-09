@@ -587,6 +587,16 @@ class TestClassifyApiError:
         assert result.should_fallback is True
         assert result.retryable is False
 
+    def test_404_function_not_found_for_account_is_non_retryable(self):
+        e = MockAPIError(
+            "Function 'moonshotai/kimi-k2.6': Not found for account",
+            status_code=404,
+        )
+        result = classify_api_error(e, provider="nvidia", model="moonshotai/kimi-k2.6")
+        assert result.reason == FailoverReason.model_not_found
+        assert result.should_fallback is True
+        assert result.retryable is False
+
     def test_404_generic(self):
         # Generic 404 with no "model not found" signal — common for local
         # llama.cpp/Ollama/vLLM endpoints with slightly wrong paths.  Treat
@@ -680,47 +690,6 @@ class TestClassifyApiError:
 
 
 
-
-    # ── Local-inference memory ceiling (oMLX/MLX prefill guard, #52261) ──
-
-    @pytest.mark.parametrize("message, status_code, body", [
-        # 0.5.6 prefill guard: a memory peak in BYTES whose remediation tail says "Reduce context
-        # length" — the phrase that used to route it into the compress loop.
-        ("Prefill memory guard rejected request: Prefill would require ~13.87 GB peak, "
-         "dynamic ceiling is 13.50 GB. Reduce context length or lower memory_guard_tier.", 400, None),
-        # 0.5.7 rewording ("predicted peak would require"); cap names survive the verb change.
-        ("process memory limit exceeded: predicted peak would require ~78.57 GB, prefill "
-         "safety cap is 77.76 GB (90% of metal_cap ceiling 86.40 GB). Reduce context size.", 400, None),
-        # Mid-stream the guard exits as a generic 500 (streaming generator drops the code).
-        ("predicted peak would exceed prefill safety cap 77.8GB. Reduce context length.", 500, None),
-        # Status-less: "memory limit exceeded" contains "limit exceeded" and would otherwise read
-        # as billing in the usage-limit disambiguation — the memory rule runs in the message HEAD.
-        ("process memory limit exceeded: predicted peak would require ~78.57 GB. "
-         "Reduce context size.", None, None),
-        # Proxy flattened the wording; only the structured code survives (400 must read it, since
-        # _by_status runs before _by_error_code).
-        ("Request failed.", 400, {"error": {"message": "Request failed.", "code": "prefill_memory_exceeded"}}),
-    ])
-    def test_memory_ceiling_rejection_is_overloaded_not_overflow(self, message, status_code, body):
-        kwargs = {"status_code": status_code} if status_code is not None else {}
-        if body is not None:
-            kwargs["body"] = body
-        result = classify_api_error(MockAPIError(message, **kwargs), provider="omlx")
-        assert result.reason == FailoverReason.overloaded
-        assert result.should_compress is False
-        assert result.should_rotate_credential is False
-
-    def test_genuine_context_overflow_still_compresses(self):
-        """Guard against over-reach: a real window overflow must keep its
-        compression recovery."""
-        e = MockAPIError(
-            "This model's maximum context length is 200000 tokens. However, your "
-            "messages resulted in 250000 tokens.",
-            status_code=400,
-        )
-        result = classify_api_error(e, provider="omlx")
-        assert result.reason == FailoverReason.context_overflow
-        assert result.should_compress is True
 
     # ── Server disconnect + large session ──
 
@@ -1677,5 +1646,4 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-
 

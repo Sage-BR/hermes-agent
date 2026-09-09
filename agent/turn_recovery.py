@@ -967,6 +967,8 @@ def interruptible_backoff_sleep(
 _ZAI_POLICY_NOTES = {
     "zai_coding_overload_long": " (Z.AI Coding overload adaptive long backoff)",
     "zai_coding_overload_short": " (Z.AI Coding overload short retry)",
+    "opencode_rate_limit": " (OpenCode temporary rate limit retry)",
+    "opencode_provider_retry": " (OpenCode temporary provider retry)",
 }
 
 
@@ -1010,14 +1012,20 @@ def compute_error_backoff(
             _retry_after = None
     wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
     _backoff_policy = None
-    _adaptive = is_rate_limited or is_zai_coding_overload
+    from agent.retry_utils import is_opencode_transient_error
+    _adaptive = is_rate_limited or is_zai_coding_overload or is_opencode_transient_error(
+        base_url=str(base_url), error=api_error)
     if _adaptive and _retry_after is None:
         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,
         )
     if _adaptive:
         _policy_note = _ZAI_POLICY_NOTES.get(_backoff_policy or "", "")
-        _wait_reason = "Provider overloaded" if is_zai_coding_overload and not is_rate_limited else "Rate limited"
+        _wait_reason = (
+            "Provider overloaded" if is_zai_coding_overload and not is_rate_limited
+            else "Rate limited" if is_rate_limited
+            else "Provider temporarily unavailable"
+        )
         _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
         if _backoff_policy == "zai_coding_overload_long":
             agent._emit_status(_rate_limit_status)
@@ -1382,10 +1390,16 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+    from agent.retry_utils import is_opencode_transient_error
+    _opencode_retry = is_opencode_transient_error(base_url=str(base_url), error=api_error)
+    if _opencode_retry:
+        # Initial request + three retries with approximately 5s, 10s and 20s waits.
+        # This keeps a recoverable OpenCode outage on the same model before fallback.
+        max_retries = max(max_retries, 4)
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
-    )
+    ) and not (_opencode_retry and retry_count < max_retries)
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
         # upstream-aggregator 429 — the pool can't help, always fall back.

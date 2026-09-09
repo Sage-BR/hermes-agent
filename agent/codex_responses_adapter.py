@@ -27,7 +27,10 @@ def _classify_responses_issuer(
     for flag, kind in ((is_xai_responses, "xai_responses"), (is_github_responses, "github_responses"), (is_codex_backend, "codex_backend")):
         if flag:
             return kind
-    return f"other:{base_url}" if base_url else "other"
+    # OpenAI-compatible clients append a trailing slash to ``base_url`` while
+    # Hermes keeps the configured route without one. They are the same issuer.
+    normalized_base = str(base_url).strip().rstrip("/") if base_url else ""
+    return f"other:{normalized_base}" if normalized_base else "other"
 
 
 # Per-process throttle for the cross-issuer skip warning.

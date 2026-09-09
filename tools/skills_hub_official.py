@@ -33,7 +33,7 @@ class OptionalSkillSource(SkillSource):
 
     SOURCE_ID = "official"
     TRUST_LEVEL = "builtin"
-    OFFICIAL_REPO = "NousResearch/hermes-agent"
+    OFFICIAL_REPO = "Sage-BR/hermes-agent"
     OPTIONAL_SKILLS_PREFIX = "optional-skills"
 
     _parse_frontmatter = staticmethod(_parse_frontmatter)

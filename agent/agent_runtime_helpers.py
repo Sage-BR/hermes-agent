@@ -19,7 +19,7 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import (
     _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants
 )
-from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
+from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
@@ -533,9 +533,6 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             # A summary carrier followed by a new user row is a deliberate durable shape after
             # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
             and split_user_originated_turn(prev)[0] is None
-            # A /steer row that ended the previous run is already persisted; merging the next
-            # prompt into it would rewrite it in place and re-break replay parity.
-            and prev.get("display_kind") != STEER_DISPLAY_KIND
             # Only merge plain-text content; leave multimodal (list) content alone.
             and isinstance(prev.get("content", ""), str) and isinstance(msg.get("content", ""), str)
         ):
@@ -914,6 +911,16 @@ def _build_anthropic_client_from_runtime(agent, rt: Dict[str, Any]) -> None:
 def _rebuild_primary_client(agent, rt: Dict[str, Any], *, reason: str) -> None:
     """Rebuild the primary client from a ``_primary_runtime`` snapshot (MoA facade / native Anthropic / OpenAI wire)."""
     if (agent.provider or "").strip().lower() == "moa":
+        # Smart Router: no facade needed; call_llm and chat_completion_helpers intercept MoA tasks
+        try:
+            from hermes_cli.config import load_config_readonly
+            _cfg = load_config_readonly() or {}
+            if (_cfg.get("moa") or {}).get("smart_router_enabled"):
+                agent.client = None
+                agent._anthropic_client = None
+                return
+        except Exception:
+            pass
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
         # reference_callback relay survives recovery.
         from agent.moa_loop import build_moa_facade
@@ -960,11 +967,18 @@ def try_recover_primary_transport(
         if agent.api_mode == "anthropic_messages":
             _build_anthropic_client_from_runtime(agent, rt)
         elif (agent.provider or "").strip().lower() == "moa":
-            # MoA is a virtual provider with empty client_kwargs — rebuilding via _create_openai_client
-            # would raise "api_key client option must be set". Recreate the facade through the shared
-            # factory so the reference_callback relay survives recovery (#53802).
-            from agent.moa_loop import build_moa_facade
-            agent.client = build_moa_facade(agent, agent.model)
+            # Smart Router: no facade needed; intercept in call_llm and chat_completion_helpers
+            try:
+                from hermes_cli.config import load_config_readonly
+                _cfg = load_config_readonly() or {}
+                if (_cfg.get("moa") or {}).get("smart_router_enabled"):
+                    agent.client = None
+                else:
+                    from agent.moa_loop import build_moa_facade
+                    agent.client = build_moa_facade(agent, agent.model)
+            except Exception:
+                from agent.moa_loop import build_moa_facade
+                agent.client = build_moa_facade(agent, agent.model)
         else:
             agent.client = agent._create_openai_client(dict(rt["client_kwargs"]), reason="primary_recovery", shared=True)
         wait_time = min(3 + retry_count, 8)
@@ -1214,9 +1228,6 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
     parts: List[str] = []
 
     def _add(text) -> None:
-        from agent.message_content import flatten_message_text
-
-        text = flatten_message_text(text, sep="")
         if text and text not in parts:
             parts.append(text)
     _add(getattr(assistant_message, "reasoning", None))
@@ -1692,6 +1703,14 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # base_url, leaks the request to a foreign gateway. Rebuild the facade instead (build_moa_facade also
     # re-wires the reference relay, see #53802).
     if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
+        # Smart Router: no facade needed; intercept in call_llm and chat_completion_helpers
+        try:
+            from hermes_cli.config import load_config_readonly
+            _cfg = load_config_readonly() or {}
+            if (_cfg.get("moa") or {}).get("smart_router_enabled"):
+                return None
+        except Exception:
+            pass
         from agent.moa_loop import build_moa_facade
         return build_moa_facade(agent, getattr(agent, "model", None) or "default")
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
@@ -1711,8 +1730,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent.provider, reason, shared, agent._client_log_context(),
         )
         return provider_client
-    from agent.auxiliary_client import _GEMINI_NATIVE_PROVIDER_NAMES
-    if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
+    if agent.provider == "gemini":
         client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
             return client
@@ -1857,6 +1875,19 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
 def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm) -> None:
     """Build the client for the switched-to destination (MoA facade / native Anthropic / OpenAI wire)."""
     if new_norm == "moa":
+        # Smart Router: no facade needed; intercept in call_llm and chat_completion_helpers
+        try:
+            from hermes_cli.config import load_config_readonly
+            _cfg = load_config_readonly() or {}
+            if (_cfg.get("moa") or {}).get("smart_router_enabled"):
+                agent.api_mode = "chat_completions"
+                agent.api_key = api_key or "moa-virtual-provider"
+                agent.base_url = "moa://local"
+                agent._client_kwargs = {}
+                agent.client = None
+                return
+        except Exception:
+            pass
         from agent.moa_loop import build_moa_facade
         # MoA speaks only chat.completions via the MoAClient facade; the aggregator's real transport
         # is applied inside the fan-out. Pin api_mode so the loop never dispatches
@@ -3150,25 +3181,9 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Persist any pending /steer text as a standalone user message.
-
-    Called at the end of a tool-call batch, before the next API call.
-
-    The steer is emitted as a NEW ``role:"user"`` message appended after the
-    last tool result (marker text included), so:
-
-    - the model still sees the self-describing out-of-band marker (same text,
-      same provenance semantics);
-    - message-role alternation stays legal — ``assistant(tool_calls) → tool →
-      user`` is the documented "user jumped in mid-run" pattern that
-      ``repair_message_sequence`` deliberately keeps;
-    - the appended dict carries no ``_DB_PERSISTED_MARKER`` yet, so the next
-      ``_flush_messages_to_session_db`` writes it to the session store — the
-      steer text finally becomes part of the durable transcript instead of
-      being smeared onto an already-persisted tool row that append-only
-      persistence never rewrites (replayed histories then diverge from the
-      live request bytes and break the provider prompt cache).
-    """
+    """Append pending /steer text to the last ``role:"tool"`` message of this batch (bounded by
+    ``num_tool_msgs``), marked as user-origin. Modifies existing content only, so role
+    alternation is preserved."""
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
@@ -3178,14 +3193,22 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
     target = next((messages[j] for j in tail if isinstance(messages[j], dict) and messages[j].get("role") == "tool"), None)
     if target is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # requeue so the fallback path delivers it as a normal next-turn
-        # user message (which persists like any other user turn).
+        # No tool result in this batch (e.g. all skipped by interrupt).
         _requeue_pending_steer(agent, steer_text)
         return
-    messages.append(steer_user_row(steer_text))
+    marker = format_steer_marker(steer_text)
+    existing_content = target.get("content", "")
+    if isinstance(existing_content, str):
+        target["content"] = existing_content + marker
+    else:
+        # Anthropic multimodal content blocks: preserve them and append a text block.
+        try:
+            target["content"] = [*(existing_content or []), {"type": "text", "text": marker.lstrip()}]
+        except Exception:
+            # Fall back to string replacement if content shape is unexpected.
+            target["content"] = f"{existing_content}{marker}"
     _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
+        "Delivered /steer to agent after tool batch (%d chars): %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
 

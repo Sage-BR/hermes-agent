@@ -64,40 +64,6 @@ def _valid_credential_pair(api_key: Any, base_url: Any) -> bool:
     return bool(isinstance(api_key, str) and api_key.strip() and isinstance(base_url, str) and base_url.strip())
 
 
-def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb_base_url: str, fb_api_mode: str) -> None:
-    """Install the fallback client(s) in place, honoring request_timeout_seconds (None = SDK default)."""
-    timeout = get_provider_request_timeout(fb_provider, fb_model)
-    # The SDK exposes an empty/stale api_key when a rotating source is installed.
-    key_provider = vars(fb_client).get("_api_key_provider")
-    credential = key_provider if callable(key_provider) else fb_client.api_key
-    if fb_api_mode == "anthropic_messages":
-        from agent.anthropic_adapter import build_anthropic_client
-        from agent.anthropic_credentials import resolve_anthropic_token, _is_oauth_token
-        is_anthropic = fb_provider == "anthropic"
-        effective_key = credential or (resolve_anthropic_token() if is_anthropic else None) or ""
-        agent.api_key = agent._anthropic_api_key = effective_key
-        agent._anthropic_base_url = fb_base_url
-        agent._anthropic_client = build_anthropic_client(effective_key, fb_base_url, timeout=timeout)
-        agent._is_anthropic_oauth = (
-            _is_oauth_token(effective_key)
-            if is_anthropic and isinstance(effective_key, str) else False
-        )
-        agent.client, agent._client_kwargs = None, {}
-        return
-    agent.api_key = credential
-    agent.client = fb_client
-    # Keep provider headers resolve_provider_client() baked into fb_client (SDK: _custom_headers), else
-    # later request-client rebuilds drop them and User-Agent-sentinel providers (Kimi Coding) 403.
-    fb_headers = getattr(fb_client, "_custom_headers", None) or getattr(fb_client, "default_headers", None)
-    agent._client_kwargs = {"api_key": credential, "base_url": fb_base_url}
-    if fb_headers:
-        agent._client_kwargs["default_headers"] = dict(fb_headers)
-    if timeout is not None:
-        agent._client_kwargs["timeout"] = timeout
-        # Rebuild now so the timeout applies to the very next request, not only after a rotation rebuild.
-        agent._replace_primary_openai_client(reason="fallback_timeout_apply")
-
-
 class ClientLifecycleMixin:
     def _close_task_resources(self, task_id: str) -> None:
         """Release task resources without treating a shared environment as process ownership."""
@@ -274,8 +240,18 @@ class ClientLifecycleMixin:
             try:
                 # MoA's ``client`` is an in-process facade, not an SDK client; generic rebuilds must preserve that.
                 if (getattr(self, "provider", "") or "").strip().lower() == "moa":
-                    from agent.moa_loop import build_moa_facade
-                    new_client = build_moa_facade(self, self.model)
+                    # Smart Router: no facade needed; intercept in call_llm and chat_completion_helpers
+                    try:
+                        from hermes_cli.config import load_config_readonly
+                        _cfg = load_config_readonly() or {}
+                        if (_cfg.get("moa") or {}).get("smart_router_enabled"):
+                            new_client = None
+                        else:
+                            from agent.moa_loop import build_moa_facade
+                            new_client = build_moa_facade(self, self.model)
+                    except Exception:
+                        from agent.moa_loop import build_moa_facade
+                        new_client = build_moa_facade(self, self.model)
                 else:
                     new_client = self._create_openai_client(self._client_kwargs, reason=reason, shared=True)
             except Exception as exc:

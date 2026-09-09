@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 # Monotonic counter for jitter-seed uniqueness within a process; locked
 # because concurrent gateway sessions retry simultaneously.
@@ -24,6 +25,8 @@ _jitter_lock = threading.Lock()
 # ``zai_coding_overload_retry_ceiling`` so the two cannot silently desync.
 _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
+_OPENCODE_RATE_LIMIT_BASE = 5.0
+_OPENCODE_RATE_LIMIT_MAX = 30.0
 
 
 def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
@@ -97,12 +100,49 @@ def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, err
     )
 
 
+def is_opencode_rate_limit_error(*, base_url: str | None, error: Any) -> bool:
+    """True for a temporary 429 from OpenCode's hosted endpoint.
+
+    OpenCode free routes commonly recover within a few seconds. They need a
+    longer same-model retry window than the generic 2s transport backoff, but
+    this policy must not affect other providers or billing/quota errors.
+    """
+    return (
+        getattr(error, "status_code", None) == 429
+        and urlparse(base_url or "").hostname == "opencode.ai"
+        and not any(marker in _error_text(error) for marker in (
+            "insufficient_quota", "quota exhausted", "daily limit", "monthly limit",
+            "insufficient balance", "billing", "credit balance",
+        ))
+    )
+
+
+def is_opencode_transient_error(*, base_url: str | None, error: Any) -> bool:
+    """True for OpenCode rate limits and temporary upstream 5xx failures."""
+    status = getattr(error, "status_code", None)
+    return (
+        urlparse(base_url or "").hostname == "opencode.ai"
+        and isinstance(status, int)
+        and (is_opencode_rate_limit_error(base_url=base_url, error=error)
+             or 500 <= status < 600)
+    )
+
+
 def adaptive_rate_limit_backoff(
     attempt: int, *, base_url: str | None, model: str | None, error: Any, default_wait: float,
     short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS,
 ) -> tuple[float, str | None]:
     """``(wait_seconds, reason_label)``: ``default_wait`` for most providers; Z.AI Coding GLM-5.2 overloads keep
     ``short_attempts`` short retries, then 30→60→90→120s with light jitter. ``attempt`` is 1-based."""
+    if is_opencode_transient_error(base_url=base_url, error=error):
+        return (
+            max(default_wait, jittered_backoff(
+                attempt, base_delay=_OPENCODE_RATE_LIMIT_BASE,
+                max_delay=_OPENCODE_RATE_LIMIT_MAX, jitter_ratio=0.25,
+            )),
+            "opencode_rate_limit" if is_opencode_rate_limit_error(base_url=base_url, error=error)
+            else "opencode_provider_retry",
+        )
     if not is_zai_coding_overload_error(base_url=base_url, model=model, error=error):
         return default_wait, None
     if attempt <= short_attempts:

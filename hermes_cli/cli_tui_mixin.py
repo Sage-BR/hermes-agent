@@ -387,7 +387,6 @@ class CLITuiMixin:
             *self._get_extra_tui_widgets(),
             getattr(self, "_pet_widget", None),
             getattr(self, "_stash_panel_widget", None),
-            getattr(self, "_subagent_dock_widget", None),
             status_bar,
             input_rule_top,
             image_bar,
@@ -402,9 +401,6 @@ class CLITuiMixin:
             if not self._app:
                 time.sleep(0.1)
                 continue
-            monitor = getattr(self, "_subagent_monitor", None)
-            if monitor is not None:
-                monitor.tick()
             if self._command_running:
                 self._invalidate(min_interval=0.1)
                 time.sleep(0.1)
@@ -1317,7 +1313,25 @@ class CLITuiMixin:
             _looks_like_slash_command)
         if self._tui_enter_overlay(event):
             return
+        # Some Windows console/PTY combinations split a large paste into raw key
+        # batches.  In that degraded path CR/LF would otherwise invoke this
+        # submit binding once per pasted line.  Convert only a recently detected
+        # high-throughput multiline burst into buffer newlines; ordinary Enter
+        # remains an immediate submit.
+        if self._tui_raw_paste_guard_active():
+            if getattr(self, "_tui_raw_paste_active", False):
+                self._tui_raw_paste_payload = getattr(self, "_tui_raw_paste_payload", "") + "\n"
+            else:
+                event.current_buffer.insert_text('\n')
+            self._tui_raw_paste_until = time.monotonic() + self._TUI_RAW_PASTE_IDLE_S
+            event.app.invalidate()
+            return
         buf = event.app.current_buffer
+        # A terminal without bracketed-paste markers may finish the paste
+        # before the idle task gets a chance to replace the visible text.
+        # Finalize it synchronously so Enter still submits one compact marker.
+        if getattr(self, "_tui_raw_paste_seen", False):
+            self._tui_finalize_raw_paste(buf)
         raw_text = buf.text
         if (
             self._tui_multiline_shortcuts
@@ -1456,9 +1470,8 @@ class CLITuiMixin:
             event.app.invalidate()
             return True
         if self._secret_state:
-            value = buf.text
+            self._submit_secret_response(buf.text)
             buf.reset()
-            self._submit_secret_response(value)
             event.app.invalidate()
             return True
         if self._approval_state:
@@ -1583,7 +1596,13 @@ class CLITuiMixin:
             "Collapsed paste #%d: %d lines, %d chars -> %s" + (" (fallback)" if fallback else ""),
             self._tui_paste_counter, line_count + 1, len(text), paste_file)
         self._tui_paste_just_collapsed = True
-        return f"[Pasted text #{self._tui_paste_counter}: {line_count + 1} lines \u2192 {paste_file}]"
+        self._tui_last_paste_number = self._tui_paste_counter
+        self._tui_last_paste_file = paste_file
+        return self._tui_format_paste_marker(self._tui_paste_counter, line_count, paste_file)
+
+    @staticmethod
+    def _tui_format_paste_marker(number: int, line_count: int, paste_file) -> str:
+        return f"[Pasted text #{number}: {line_count + 1} lines \u2192 {paste_file}]"
 
     def _tui_paste_over_threshold(self, text: str, line_count: int, threshold_key: str) -> bool:
         threshold = self.config.get(threshold_key, 5)
@@ -1619,14 +1638,27 @@ class CLITuiMixin:
             pasted_text = _sanitize_surrogates(pasted_text)
             line_count = pasted_text.count('\n')
             buf = event.current_buffer
-            if (
-                self._tui_paste_over_threshold(pasted_text, line_count, "paste_collapse_threshold")
-                and not buf.text.strip().startswith('/')):
-                placeholder = self._tui_collapse_paste(pasted_text, line_count, fallback=False)
-                prefix = "\n" if buf.cursor_position > 0 and buf.text[buf.cursor_position - 1] != '\n' else ""
-                buf.insert_text(prefix + placeholder)
-            else:
-                buf.insert_text(pasted_text)
+            # The bracketed event is already atomic.  Suppress the raw-paste
+            # heuristic while its single buffer mutation fires on_text_changed.
+            self._tui_atomic_paste_depth = getattr(self, "_tui_atomic_paste_depth", 0) + 1
+            try:
+                if (
+                    self._tui_paste_over_threshold(pasted_text, line_count, "paste_collapse_threshold")
+                    and not buf.text.strip().startswith('/')):
+                    placeholder = self._tui_collapse_paste(pasted_text, line_count, fallback=False)
+                    prefix = "\n" if buf.cursor_position > 0 and buf.text[buf.cursor_position - 1] != '\n' else ""
+                    buf.insert_text(prefix + placeholder)
+                else:
+                    buf.insert_text(pasted_text)
+            finally:
+                self._tui_atomic_paste_depth = max(0, self._tui_atomic_paste_depth - 1)
+            self._tui_raw_paste_until = 0.0
+            logger.debug(
+                "Atomic bracketed paste captured: bytes=%d lines=%d images=%d",
+                len(pasted_text.encode("utf-8", errors="replace")),
+                line_count + 1,
+                len(getattr(self, "_attached_images", ())),
+            )
         _paste_handler_elapsed_ms = (time.perf_counter() - _paste_handler_start) * 1000.0
         if _paste_handler_elapsed_ms > 500.0:
             logger.warning(
@@ -1646,6 +1678,13 @@ class CLITuiMixin:
         but batch newlines; Alt+Enter adds 1 newline per event so never trips it).
         """
         from cli import _strip_leaked_bracketed_paste_wrappers, _strip_leaked_terminal_responses_with_meta
+        # Once a markerless paste has been recognized, keep subsequent Windows
+        # input batches out of the visible buffer.  Without this branch the
+        # first batch is hidden only after the stream goes idle, which is the
+        # exact "loads everything, then becomes Pasted text" behavior users see.
+        if getattr(self, "_tui_raw_paste_active", False):
+            self._tui_capture_active_raw_paste(buf)
+            return
         text = _strip_leaked_bracketed_paste_wrappers(buf.text)
         text, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(text)
         if _had_mouse_reports:
@@ -1668,13 +1707,205 @@ class CLITuiMixin:
         line_count = text.count('\n')
         newlines_added = line_count - self._tui_prev_newline_count
         self._tui_prev_newline_count = line_count
+        now = time.monotonic()
+        if getattr(self, "_tui_atomic_paste_depth", 0):
+            return
+        # Track a short high-throughput window.  This catches terminals that
+        # omit bracketed-paste markers or split a Windows paste across multiple
+        # ReadConsoleInput batches, while normal typing stays below the guard.
+        window_started = getattr(self, "_tui_raw_paste_window_started", 0.0)
+        if not window_started or now - window_started > self._TUI_RAW_PASTE_WINDOW_S:
+            self._tui_raw_paste_window_started = now
+            self._tui_raw_paste_window_chars = 0
+        self._tui_raw_paste_window_chars = (
+            getattr(self, "_tui_raw_paste_window_chars", 0) + max(0, chars_added)
+        )
         is_paste = chars_added > 1 or newlines_added >= 4
+        raw_paste_evidence = (
+            newlines_added >= 1 and self._tui_raw_paste_window_chars >= self._TUI_RAW_PASTE_MIN_CHARS
+        ) or self._tui_raw_paste_window_chars >= self._TUI_RAW_PASTE_START_CHARS
+        if is_paste or self._tui_raw_paste_window_chars >= self._TUI_RAW_PASTE_MIN_CHARS:
+            self._tui_raw_paste_until = now + self._TUI_RAW_PASTE_IDLE_S
+            self._tui_raw_paste_seen = True
+            from cli import logger
+            logger.debug(
+                "Raw multiline paste guard armed: chars=%d lines=%d delta=%d",
+                len(text),
+                line_count + 1,
+                chars_added,
+            )
+            if raw_paste_evidence and not text.startswith('/'):
+                self._tui_begin_active_raw_paste(buf, text, line_count)
+                return
+            self._tui_schedule_raw_paste_finalize(buf)
+        # Do not collapse a raw paste while it is still arriving.  Collapsing
+        # partial batches creates several placeholders and makes the input look
+        # like multiple messages even though it belongs to one paste gesture.
+        if self._tui_raw_paste_guard_active():
+            return
         if (
             self._tui_paste_over_threshold(text, line_count, "paste_collapse_threshold_fallback")
             and is_paste
             and not text.startswith('/')):
             buf.text = self._tui_collapse_paste(text, line_count, fallback=True)
             buf.cursor_position = len(buf.text)
+
+    _TUI_RAW_PASTE_WINDOW_S = 0.12
+    _TUI_RAW_PASTE_IDLE_S = 0.35
+    _TUI_RAW_PASTE_MIN_CHARS = 12
+    _TUI_RAW_PASTE_START_CHARS = 64
+
+    def _tui_begin_active_raw_paste(self, buf, text: str, line_count: int) -> None:
+        """Replace the first recognized raw-paste batch immediately.
+
+        Windows can deliver a clipboard paste as several console batches.  The
+        marker is installed on the first sufficiently large batch; later
+        batches are collected in memory and never rendered as prompt text.
+        """
+        if getattr(self, "_tui_raw_paste_active", False):
+            return
+        placeholder = self._tui_collapse_paste(text, line_count, fallback=True)
+        self._tui_raw_paste_active = True
+        self._tui_raw_paste_payload = text
+        self._tui_raw_paste_placeholder = placeholder
+        self._tui_raw_paste_number = getattr(self, "_tui_last_paste_number", self._tui_paste_counter)
+        self._tui_raw_paste_file = getattr(self, "_tui_last_paste_file", None)
+        self._skip_paste_collapse = True
+        buf.text = placeholder
+        buf.cursor_position = len(placeholder)
+        try:
+            from cli import logger
+            logger.debug(
+                "Raw multiline paste marker installed: bytes=%d lines=%d",
+                len(text.encode("utf-8", errors="replace")),
+                line_count + 1,
+            )
+        except Exception:
+            pass
+
+    def _tui_capture_active_raw_paste(self, buf) -> None:
+        """Collect a following raw batch without displaying it in the prompt."""
+        placeholder = getattr(self, "_tui_raw_paste_placeholder", "")
+        current = getattr(buf, "text", "") or ""
+        if not placeholder or not current.startswith(placeholder):
+            return
+        tail = current[len(placeholder):]
+        if tail:
+            self._tui_raw_paste_payload = getattr(self, "_tui_raw_paste_payload", "") + tail
+            self._tui_raw_paste_until = time.monotonic() + self._TUI_RAW_PASTE_IDLE_S
+            self._tui_schedule_raw_paste_finalize(buf)
+            self._skip_paste_collapse = True
+            buf.text = placeholder
+            buf.cursor_position = len(placeholder)
+        self._tui_prev_text_len = len(placeholder)
+        self._tui_prev_newline_count = placeholder.count('\n')
+
+    def _tui_schedule_raw_paste_finalize(self, buf) -> None:
+        """Schedule one UI-thread finalize after the raw paste becomes idle."""
+        app = getattr(self, "_app", None)
+        if app is None or not getattr(app, "is_running", False):
+            return
+        if getattr(self, "_tui_raw_paste_idle_task", None) is not None:
+            return
+        try:
+            self._tui_raw_paste_idle_task = app.create_background_task(
+                self._tui_finalize_raw_paste_when_idle(buf)
+            )
+        except Exception:
+            self._tui_raw_paste_idle_task = None
+
+    async def _tui_finalize_raw_paste_when_idle(self, buf) -> None:
+        """Collapse a markerless paste only after its input stream is quiet."""
+        from asyncio import sleep
+        try:
+            while True:
+                remaining = getattr(self, "_tui_raw_paste_until", 0.0) - time.monotonic()
+                if remaining <= 0:
+                    break
+                await sleep(min(0.05, remaining))
+            self._tui_finalize_raw_paste(buf)
+        finally:
+            self._tui_raw_paste_idle_task = None
+
+    def _tui_finalize_raw_paste(self, buf) -> None:
+        """Replace a completed markerless paste with one file reference."""
+        if not getattr(self, "_tui_raw_paste_seen", False):
+            return
+        if getattr(self, "_tui_raw_paste_active", False):
+            payload = getattr(self, "_tui_raw_paste_payload", "")
+            paste_file = getattr(self, "_tui_raw_paste_file", None)
+            if not payload or paste_file is None:
+                self._tui_raw_paste_active = False
+                self._tui_raw_paste_seen = False
+                self._tui_raw_paste_until = 0.0
+                return
+            paste_file.write_text(payload, encoding="utf-8")
+            line_count = payload.count('\n')
+            if not self._tui_paste_over_threshold(
+                payload, line_count, "paste_collapse_threshold_fallback"
+            ):
+                paste_file.unlink(missing_ok=True)
+                self._tui_raw_paste_active = False
+                self._tui_raw_paste_payload = ""
+                self._tui_raw_paste_placeholder = ""
+                self._tui_raw_paste_file = None
+                self._tui_raw_paste_seen = False
+                self._tui_raw_paste_until = 0.0
+                self._skip_paste_collapse = True
+                buf.text = payload
+                buf.cursor_position = len(payload)
+                return
+            final_marker = self._tui_format_paste_marker(
+                getattr(self, "_tui_raw_paste_number", self._tui_paste_counter),
+                line_count,
+                paste_file,
+            )
+            self._tui_raw_paste_active = False
+            self._tui_raw_paste_payload = ""
+            self._tui_raw_paste_placeholder = ""
+            self._tui_raw_paste_file = None
+            self._tui_raw_paste_seen = False
+            self._tui_raw_paste_until = 0.0
+            self._skip_paste_collapse = True
+            buf.text = final_marker
+            buf.cursor_position = len(final_marker)
+            try:
+                from cli import logger
+                logger.debug(
+                    "Raw multiline paste finalized: bytes=%d lines=%d",
+                    len(payload.encode("utf-8", errors="replace")),
+                    line_count + 1,
+                )
+            except Exception:
+                pass
+            return
+        self._tui_raw_paste_seen = False
+        self._tui_raw_paste_until = 0.0
+        text = getattr(buf, "text", "") or ""
+        if not text or text.lstrip().startswith('/'):
+            return
+        line_count = text.count('\n')
+        if not self._tui_paste_over_threshold(text, line_count, "paste_collapse_threshold_fallback"):
+            return
+        placeholder = self._tui_collapse_paste(text, line_count, fallback=True)
+        self._skip_paste_collapse = True
+        buf.text = placeholder
+        buf.cursor_position = len(placeholder)
+        try:
+            from cli import logger
+            logger.debug(
+                "Raw multiline paste finalized: bytes=%d lines=%d",
+                len(text.encode("utf-8", errors="replace")),
+                line_count + 1,
+            )
+        except Exception:
+            pass
+
+    def _tui_raw_paste_guard_active(self) -> bool:
+        """Return whether the current key stream looks like a raw multiline paste."""
+        if getattr(self, "_tui_atomic_paste_depth", 0):
+            return False
+        return time.monotonic() < getattr(self, "_tui_raw_paste_until", 0.0)
 
     def _tui_handle_prompt_stash(self, event):
         """Ctrl+S: composer has content → push onto the stash and clear; empty + one stashed →
@@ -1858,12 +2089,6 @@ class CLITuiMixin:
         kb.add(Keys.BracketedPaste, eager=True)(self._tui_handle_paste)
         kb.add('c-v')(self._tui_handle_ctrl_v)
         kb.add('escape', 'v')(self._tui_handle_alt_v)
-        from hermes_cli.cli_subagent_monitor import modal_prompt_active, open_monitor, toggle_dock
-        for key in ('c-t', 'f6'):
-            kb.add(key, filter=Condition(lambda: not modal_prompt_active(self)))(
-                lambda event: open_monitor(self))
-        kb.add('f7', filter=Condition(lambda: not modal_prompt_active(self)))(
-            lambda event: toggle_dock(self))
         return kb
 
     def _tui_bind_editor_and_stash(self, kb) -> None:
@@ -2011,8 +2236,6 @@ class CLITuiMixin:
     def _tui_build_layout(self, kb):
         """Build the TUI widgets, Layout and Style; registers wrapper keybindings on ``kb``."""
         cli_ref = self
-        from hermes_cli.cli_subagent_monitor import install_dock
-        install_dock(self)
         input_area = self._tui_build_input_area()
         spinner_widget = Window(
             content=FormattedTextControl(self._tui_spinner_text),
@@ -2144,6 +2367,17 @@ class CLITuiMixin:
         self._tui_prev_newline_count = 0
         self._tui_paste_just_collapsed = False
         self._skip_paste_collapse = False
+        self._tui_atomic_paste_depth = 0
+        self._tui_raw_paste_until = 0.0
+        self._tui_raw_paste_seen = False
+        self._tui_raw_paste_active = False
+        self._tui_raw_paste_payload = ""
+        self._tui_raw_paste_placeholder = ""
+        self._tui_raw_paste_number = 0
+        self._tui_raw_paste_file = None
+        self._tui_raw_paste_idle_task = None
+        self._tui_raw_paste_window_started = 0.0
+        self._tui_raw_paste_window_chars = 0
         input_area.buffer.on_text_changed += self._tui_on_text_changed
         # Mask input with '*' while a sudo/secret prompt is active.
         input_area.control.input_processors.append(ConditionalProcessor(

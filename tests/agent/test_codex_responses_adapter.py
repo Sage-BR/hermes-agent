@@ -11,6 +11,7 @@ from agent.codex_responses_adapter import (
     _neutralize_harmony_tokens,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
+    _classify_responses_issuer,
 )
 
 
@@ -19,6 +20,11 @@ _HARMONY_SOURCE_SNIPPET = (
     "Need to generate one image according to the description."
     "<|end|><|start|>assistant<|channel|>final<|message|>"
 )
+
+
+def test_responses_issuer_normalizes_trailing_slash():
+    assert _classify_responses_issuer(base_url="https://opencode.ai/zen/v1") == \
+        _classify_responses_issuer(base_url="https://opencode.ai/zen/v1/")
 
 
 def test_chat_content_drops_images_from_assistant_role():
